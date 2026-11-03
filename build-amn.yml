@@ -1,0 +1,1053 @@
+name: Build AMN Pro APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_version:
+        description: 'App Version (e.g., 3.1.7 or 3.2.0 for updates)'
+        required: false
+        default: '3.1.7'
+      release_notes:
+        description: 'Release Notes (shown in the in-app update dialog)'
+        required: false
+        default: '• بهبود سرعت و پایداری اتصال و بهینه‌سازی رابط کاربری اختصاصی AMN'
+
+permissions:
+  contents: write
+
+jobs:
+  build-amn:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. Checkout ZedSecure v3.1.6 Source
+        uses: actions/checkout@v4
+        with:
+          repository: CluvexStudio/ZedSecure
+          ref: v3.1.6
+
+      - name: 2. Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: 3. Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: 4. Setup NDK & Build VPN Cores
+        run: |
+          DEFAULT_NDK=$(ls -d $ANDROID_HOME/ndk/* 2>/dev/null | sort -V | tail -n 1)
+          if [ -n "$DEFAULT_NDK" ]; then
+            export ANDROID_NDK_HOME="$DEFAULT_NDK"
+            export NDK_HOME="$DEFAULT_NDK"
+            echo "ANDROID_NDK_HOME=$DEFAULT_NDK" >> $GITHUB_ENV
+          fi
+
+          chmod +x ./tools/*.sh 2>/dev/null || true
+          if [ -f "./tools/fetch-cores.sh" ]; then
+            ./tools/fetch-cores.sh || true
+          fi
+          if [ -f "./tools/get-cores.sh" ]; then
+            ./tools/get-cores.sh android || true
+          fi
+          if [ -f "./tools/build-zedcore.sh" ]; then
+            ./tools/build-zedcore.sh || true
+          fi
+
+      - name: 5. Safe Rebrand to AMN & Dynamic Version Setup
+        env:
+          MY_REPO: ${{ github.repository }}
+          APP_VER: ${{ inputs.app_version || '3.1.7' }}
+          RUN_NUM: ${{ github.run_number }}
+        run: |
+          python3 - << 'EOF'
+          import os, re
+
+          my_repo = os.environ.get("MY_REPO", "alimourdini1/AMN")
+          app_ver = os.environ.get("APP_VER", "3.1.7").strip() or "3.1.7"
+          run_num = int(os.environ.get("RUN_NUM", "1"))
+          ver_code = 100 + run_num
+
+          # 0. Auto-increment versionCode & set versionName so updates install without uninstalling
+          grad_props = "gradle.properties"
+          if os.path.exists(grad_props):
+              with open(grad_props, "r", encoding="utf-8") as f:
+                  gp = f.read()
+              gp = re.sub(r'zedsecure\.versionName=.*', f'zedsecure.versionName={app_ver}', gp)
+              gp = re.sub(r'zedsecure\.versionCode=.*', f'zedsecure.versionCode={ver_code}', gp)
+              with open(grad_props, "w", encoding="utf-8") as f:
+                  f.write(gp)
+
+          # 1. Change applicationId to com.amn.vpn
+          for root, _, files in os.walk("app"):
+              for file in files:
+                  if file in ("build.gradle", "build.gradle.kts"):
+                      path = os.path.join(root, file)
+                      with open(path, "r", encoding="utf-8") as f:
+                          content = f.read()
+                      content = re.sub(
+                          r'applicationId\s*=\s*"com\.zedsecure\.vpn"',
+                          'applicationId = "com.amn.vpn"',
+                          content
+                      )
+                      with open(path, "w", encoding="utf-8") as f:
+                          f.write(content)
+
+          # 2. Update provider authorities in AndroidManifest.xml
+          manifest_path = "app/src/main/AndroidManifest.xml"
+          if os.path.exists(manifest_path):
+              with open(manifest_path, "r", encoding="utf-8") as f:
+                  m_text = f.read()
+              m_text = m_text.replace('android:authorities="com.zedsecure.vpn', 'android:authorities="com.amn.vpn')
+              with open(manifest_path, "w", encoding="utf-8") as f:
+                  f.write(m_text)
+
+          # 3. Update strings.xml in app/src/main/res
+          for root, _, files in os.walk("app/src/main/res"):
+              for file in files:
+                  if file == "strings.xml":
+                      path = os.path.join(root, file)
+                      try:
+                          with open(path, "r", encoding="utf-8") as f:
+                              text = f.read()
+                          orig = text
+                          text = re.sub(
+                              r'>([^<]*?)ZedSecure([^<]*?)<',
+                              lambda m: f'>{m.group(1)}AMN{m.group(2)}<',
+                              text
+                          )
+                          text = re.sub(r'https?://t\.me/[a-zA-Z0-9_]+', 'https://t.me/A_Mourdini_N', text)
+                          text = re.sub(r'@CluvexStudio', '@A_Mourdini_N', text, flags=re.IGNORECASE)
+                          if text != orig:
+                              with open(path, "w", encoding="utf-8") as f:
+                                  f.write(text)
+                      except Exception:
+                          pass
+
+          # 4. Update display names, User-Agent, and GitHub repo across both app and shared Kotlin files
+          for base_dir in ("app/src/main", "shared/src"):
+              for root, _, files in os.walk(base_dir):
+                  for file in files:
+                      if file.endswith(".kt"):
+                          path = os.path.join(root, file)
+                          try:
+                              with open(path, "r", encoding="utf-8") as f:
+                                  text = f.read()
+                              orig = text
+                              text = re.sub(r'https?://t\.me/[a-zA-Z0-9_]+', 'https://t.me/A_Mourdini_N', text)
+                              text = re.sub(r'@CluvexStudio', '@A_Mourdini_N', text, flags=re.IGNORECASE)
+                              text = text.replace('"ZedSecure"', '"AMN"')
+                              text = text.replace('"ZedSecure VPN"', '"AMN VPN"')
+                              text = text.replace('"ZedSecure/', '"AMN/')
+                              text = text.replace('"ZedSecure-SpeedTest"', '"AMN-SpeedTest"')
+                              text = text.replace("CluvexStudio/ZedSecure", my_repo)
+                              if text != orig:
+                                  with open(path, "w", encoding="utf-8") as f:
+                                      f.write(text)
+                          except Exception:
+                              pass
+          EOF
+
+      - name: 5b. AMN UI Changes, Auto-Update Popup & Default Settings
+        run: |
+          python3 - << 'PYEOF'
+          import re, sys, glob
+
+          def fail(msg):
+              print("AMN PATCH FAILED: " + msg)
+              sys.exit(1)
+
+          def read(p):
+              with open(p, "r", encoding="utf-8") as f:
+                  return f.read()
+
+          def write(p, t):
+              with open(p, "w", encoding="utf-8") as f:
+                  f.write(t)
+
+          KT = "shared/src/commonMain/kotlin/dev/cluvex/zedsecure/ui"
+
+          # 1) Home title: app_name -> AMN
+          n = 0
+          for p in glob.glob("shared/src/commonMain/composeResources/values*/strings.xml"):
+              t = read(p)
+              new = re.sub(r'(<string name="app_name">)[^<]*(</string>)', r'\1AMN\2', t)
+              if new != t:
+                  write(p, new)
+                  n += 1
+          if n == 0:
+              fail("app_name not found in shared strings.xml")
+
+          # 2) Settings screen
+          p = KT + "/settings/SettingsScreen.kt"
+          t = read(p)
+
+          # 2a) remove the "Support the project" banner group
+          pat = re.compile(
+              r'\n[ ]*SettingsGroup\(modifier = Modifier\.tourTargetInPage\(TourTargets\.SETTINGS_SUPPORT\)\) \{\n'
+              r'[ ]*SettingsBannerRow\(\n.*?\) \{ onOpen\(SettingsPage\.Support\) \}\n'
+              r'[ ]*\}\n', re.S)
+          t, c = pat.subn('\n', t, count=1)
+          if c != 1:
+              fail("support banner block not found")
+
+          # 2b) About group: keep Check for Updates row + Created By Ali Mourdini + Support rows (without AboutSheet popup)
+          start = t.index('stringResource(Res.string.settings_about),\n            modifier = Modifier.tourTargetInPage(TourTargets.SETTINGS_ABOUT),')
+          gstart = t.index('{', start)
+          body_start = t.index('val fromPlay', gstart)
+          ver_row = t.index('SettingsMenuRow(\n                stringResource(Res.string.settings_about),\n                AppInfo.versionName,', body_start)
+          ver_end = t.index('{ onAbout() }', ver_row) + len('{ onAbout() }')
+          new_rows = "\n".join([
+              'val fromPlay = platform.distribution == Distribution.PlayStore',
+              '            SettingsMenuRow(',
+              '                stringResource(Res.string.update_check_title),',
+              '                when {',
+              '                    checking -> stringResource(Res.string.update_checking)',
+              '                    fromPlay -> stringResource(Res.string.update_check_summary)',
+              '                    else -> stringResource(Res.string.update_check_summary_github)',
+              '                },',
+              '                art = SettingsArts.Update,',
+              '                trailing = if (checking) {',
+              '                    { SettingsBusyIndicator() }',
+              '                } else {',
+              '                    null',
+              '                },',
+              '            ) { if (!checking) { checking = true; checkTrigger++ } }',
+              '            SettingsMenuRow(',
+              '                "Created By Ali Mourdini",',
+              '                art = SettingsArts.About,',
+              '            ) { }',
+              '            SettingsMenuRow(',
+              '                "Support",',
+              '                "@A_Mourdini_N",',
+              '                art = SettingsArts.Support,',
+              '            ) { platform.openUri("https://t.me/A_Mourdini_N") }',
+          ])
+          t = t[:body_start] + new_rows + t[ver_end:]
+          write(p, t)
+
+          # 2c) Change "Z" to "A" in AppDesignPicker.kt (Old design preview card)
+          p_design = KT + "/settings/AppDesignPicker.kt"
+          t_design = read(p_design)
+          old_z_design = 'Text("Z", color = Color.White, style = MaterialTheme.typography.titleLargeEmphasized)'
+          if old_z_design not in t_design:
+              fail("Z text not found in AppDesignPicker.kt")
+          write(p_design, t_design.replace(old_z_design, 'Text("A", color = Color.White, style = MaterialTheme.typography.titleLargeEmphasized)', 1))
+
+          # 2d) Change "Z" to "A" in Onboarding.kt (Tour offer step card)
+          p_onb = KT + "/onboarding/Onboarding.kt"
+          t_onb = read(p_onb)
+          old_z_onb = '            Text(\n                "Z",\n                style = MaterialTheme.typography.displayLargeEmphasized,'
+          new_a_onb = '            Text(\n                "A",\n                style = MaterialTheme.typography.displayLargeEmphasized,'
+          if old_z_onb not in t_onb:
+              fail("Z text not found in Onboarding.kt")
+          write(p_onb, t_onb.replace(old_z_onb, new_a_onb, 1))
+
+          # 2e) Change "Z" to "A" on HomeScreen.kt (Old design main connect button) and AppearancePickers.kt (Hero style preview)
+          p_home = KT + "/home/HomeScreen.kt"
+          t_home = read(p_home)
+          old_z_home = '                else -> Text(\n                    text = "Z",'
+          new_a_home = '                else -> Text(\n                    text = "A",'
+          if old_z_home not in t_home:
+              fail("Z text not found in HomeScreen.kt")
+          write(p_home, t_home.replace(old_z_home, new_a_home, 1))
+
+          p_pickers = KT + "/settings/AppearancePickers.kt"
+          t_pickers = read(p_pickers)
+          old_z_pickers = ') { Text("Z", color = on, fontSize = 18.sp, fontWeight = FontWeight.Bold) }'
+          new_a_pickers = ') { Text("A", color = on, fontSize = 18.sp, fontWeight = FontWeight.Bold) }'
+          if old_z_pickers not in t_pickers:
+              fail("Z text not found in AppearancePickers.kt")
+          write(p_pickers, t_pickers.replace(old_z_pickers, new_a_pickers, 1))
+
+          # 2f) Replace Z vector glyph with A in ic_zed_glyph.xml and ic_zed_mark.xml (used in PortalHome, etc.)
+          a_path_512 = "M256,86 L432,426 L342,426 L306,350 L206,350 L170,426 L80,426 Z M228,284 L284,284 L256,218 Z"
+          p_glyph = "shared/src/commonMain/composeResources/drawable/ic_zed_glyph.xml"
+          write(p_glyph, "\n".join([
+              '<vector xmlns:android="http://schemas.android.com/apk/res/android"',
+              '    android:width="24dp"',
+              '    android:height="24dp"',
+              '    android:viewportWidth="512"',
+              '    android:viewportHeight="512">',
+              f'    <path android:fillColor="#FFFFFFFF" android:pathData="{a_path_512}" />',
+              '</vector>',
+          ]))
+          p_mark = "shared/src/commonMain/composeResources/drawable/ic_zed_mark.xml"
+          write(p_mark, "\n".join([
+              '<vector xmlns:android="http://schemas.android.com/apk/res/android"',
+              '    android:width="512dp"',
+              '    android:height="512dp"',
+              '    android:viewportWidth="512"',
+              '    android:viewportHeight="512">',
+              '    <path android:fillColor="#FF00F5D4" android:pathData="M112,0 L400,0 A112,112 0 0 1 512,112 L512,400 A112,112 0 0 1 400,512 L112,512 A112,112 0 0 1 0,400 L0,112 A112,112 0 0 1 112,0 Z" />',
+              f'    <path android:fillColor="#FF090D16" android:pathData="{a_path_512}" />',
+              '</vector>',
+          ]))
+
+          # 2g) Add "AMN Cyber" signature preset to ThemeProfiles.kt
+          p_themes = KT + "/theme/ThemeProfiles.kt"
+          t_themes = read(p_themes)
+          amn_profile = "\n".join([
+              'val ThemeProfiles: List<ThemeProfile> = listOf(',
+              '    ThemeProfile(',
+              '        id = "amn_cyber",',
+              '        name = "AMN Cyber",',
+              '        accentIndex = 2,',
+              '        amoled = true,',
+              '        download = 0xFF00F5D4,',
+              '        upload = 0xFF38BDF8,',
+              '        downloadTile = 0xFF072624,',
+              '        uploadTile = 0xFF091E36,',
+              '        connect = 0xFF00F5D4,',
+              '        connected = 0xFF2563EB,',
+              '        tapHint = 0xFF99F6E4,',
+              '        serverCard = 0xFF0B1528,',
+              '        serverActive = 0xFF00F5D4,',
+              '        configCard = 0xFF0D1B33,',
+              '        configCardText = 0xFFECFEFF,',
+              '    ),',
+          ])
+          if 'val ThemeProfiles: List<ThemeProfile> = listOf(' not in t_themes:
+              fail("ThemeProfiles list not found")
+          write(p_themes, t_themes.replace('val ThemeProfiles: List<ThemeProfile> = listOf(', amn_profile, 1))
+
+          # 2h) Enable auto-update subscriptions (every 1h), auto-test, and auto-sort by default
+          p_settings_model = "shared/src/commonMain/kotlin/dev/cluvex/zedsecure/domain/model/AppSettings.kt"
+          t_model = read(p_settings_model)
+          old_sub_defaults = "\n".join([
+              '    val autoUpdateSubscriptions: Boolean = false,',
+              '    val subscriptionUpdateIntervalHours: Int = 12,',
+              '    val autoTestAfterUpdate: Boolean = false,',
+              '    val autoRemoveInvalidAfterTest: Boolean = false,',
+              '    val autoSortAfterTest: Boolean = false,',
+          ])
+          new_sub_defaults = "\n".join([
+              '    val autoUpdateSubscriptions: Boolean = true,',
+              '    val subscriptionUpdateIntervalHours: Int = 1,',
+              '    val autoTestAfterUpdate: Boolean = true,',
+              '    val autoRemoveInvalidAfterTest: Boolean = false,',
+              '    val autoSortAfterTest: Boolean = true,',
+          ])
+          if old_sub_defaults not in t_model:
+              fail("subscription defaults block not found in AppSettings.kt")
+          write(p_settings_model, t_model.replace(old_sub_defaults, new_sub_defaults, 1))
+
+          p_repo = "app/src/main/java/dev/cluvex/zedsecure/data/settings/SettingsRepository.kt"
+          t_repo = read(p_repo)
+          old_repo_init = '        val d = AppSettings(useZepTun = true, directDns = "localhost")'
+          new_repo_init = "\n".join([
+              '        val d = AppSettings(useZepTun = true, directDns = "localhost")',
+              '        if (!prefs.getBoolean("amn_sub_defaults_v1", false)) {',
+              '            prefs.edit()',
+              '                .putBoolean("auto_sub", true)',
+              '                .putInt("sub_interval", 1)',
+              '                .putBoolean("auto_test_after_update", true)',
+              '                .putBoolean("auto_sort_after_test", true)',
+              '                .putBoolean("amn_sub_defaults_v1", true)',
+              '                .apply()',
+              '        }',
+          ])
+          if old_repo_init not in t_repo:
+              fail("SettingsRepository init line not found")
+          write(p_repo, t_repo.replace(old_repo_init, new_repo_init, 1))
+
+          # 2i) Connect GitHub Auto-Update Checker & Main Screen Popup to AMN Releases
+          p_upd = "shared/src/commonMain/kotlin/dev/cluvex/zedsecure/data/update/UpdateChecker.kt"
+          t_upd = read(p_upd)
+          old_apk_lookup = "\n".join([
+              '        val apk = if (abis.isEmpty()) null else {',
+              '            (abis.map { "ZedSecure-$version-$it.apk" } + "ZedSecure-$version-universal.apk")',
+              '                .firstNotNullOfOrNull { assets[it] }',
+              '        }',
+          ])
+          new_apk_lookup = "\n".join([
+              '        val apk = abis.firstNotNullOfOrNull { abi ->',
+              '            assets.entries.firstOrNull { (name, _) ->',
+              '                name.endsWith(".apk", ignoreCase = true) && name.contains(abi, ignoreCase = true)',
+              '            }?.value',
+              '        } ?: assets.entries.firstOrNull { (name, _) -> name.endsWith(".apk", ignoreCase = true) }?.value',
+          ])
+          if old_apk_lookup not in t_upd:
+              fail("apk lookup not found in UpdateChecker.kt")
+          t_upd = t_upd.replace(old_apk_lookup, new_apk_lookup, 1)
+
+          old_notes = "\n".join([
+              '        val start = markdown.indexOf(WHATS_NEW)',
+              '        if (start < 0) return ""',
+              '        val section = markdown.substring(start + WHATS_NEW.length).substringBefore("\\n<sub>").substringBefore("\\n### ")',
+          ])
+          new_notes = "\n".join([
+              '        val start = markdown.indexOf(WHATS_NEW)',
+              '        val section = if (start >= 0) {',
+              '            markdown.substring(start + WHATS_NEW.length).substringBefore("\\n<sub>").substringBefore("\\n### ")',
+              '        } else {',
+              '            markdown.substringBefore("\\n<sub>")',
+              '        }',
+          ])
+          if old_notes not in t_upd:
+              fail("releaseNotesFrom block not found in UpdateChecker.kt")
+          t_upd = t_upd.replace(old_notes, new_notes, 1)
+
+          t_upd = t_upd.replace(
+              "const val UPDATE_CHECK_INTERVAL_MS = 12L * 60 * 60 * 1000",
+              "const val UPDATE_CHECK_INTERVAL_MS = 15L * 60 * 1000",
+              1
+          )
+          write(p_upd, t_upd)
+
+          p_nudge = KT + "/update/NudgeHost.kt"
+          t_nudge = read(p_nudge)
+          old_nudge = "\n".join([
+              '    LaunchedEffect(settings.lastUpdateCheckMs) {',
+              '        val now = currentTimeMillis()',
+              '        if (settings.lastUpdateCheckMs == 0L) {',
+              '            onUpdateSettings { it.copy(lastUpdateCheckMs = now) }',
+              '            return@LaunchedEffect',
+              '        }',
+              '        if (now - settings.lastUpdateCheckMs < NudgePolicy.UPDATE_CHECK_INTERVAL_MS) return@LaunchedEffect',
+              '',
+              '        onUpdateSettings { it.copy(lastUpdateCheckMs = now) }',
+              '        val socks = if (VpnManager.status.value.state == ConnectionState.Connected) {',
+              '            VpnManager.activeSocksPort',
+              '        } else {',
+              '            null',
+              '        }',
+              '        val info = UpdateChecker.fetchLatest(',
+              '            platform.distribution,',
+              '            platform.deviceAbis,',
+              '            socks,',
+              '            settings.language.tag ?: "en",',
+              '        ) ?: return@LaunchedEffect',
+          ])
+          new_nudge = "\n".join([
+              '    LaunchedEffect(status.state == ConnectionState.Connected) {',
+              '        val now = currentTimeMillis()',
+              '        if (settings.lastUpdateCheckMs != 0L && now - settings.lastUpdateCheckMs < NudgePolicy.UPDATE_CHECK_INTERVAL_MS) return@LaunchedEffect',
+              '',
+              '        val socks = if (VpnManager.status.value.state == ConnectionState.Connected) {',
+              '            VpnManager.activeSocksPort',
+              '        } else {',
+              '            null',
+              '        }',
+              '        val info = UpdateChecker.fetchLatest(',
+              '            platform.distribution,',
+              '            platform.deviceAbis,',
+              '            socks,',
+              '            settings.language.tag ?: "en",',
+              '        ) ?: return@LaunchedEffect',
+              '        onUpdateSettings { it.copy(lastUpdateCheckMs = now) }',
+          ])
+          if old_nudge not in t_nudge:
+              fail("LaunchedEffect block not found in NudgeHost.kt")
+          write(p_nudge, t_nudge.replace(old_nudge, new_nudge, 1))
+
+          # 3) Drop the tour step that pointed at the removed banner
+          p = KT + "/onboarding/TourSteps.kt"
+          t = read(p)
+          pat = re.compile(
+              r'\n[ ]*TourStep\(\n[ ]*target = TourTargets\.SETTINGS_SUPPORT,\n.*?\n[ ]*\),\n', re.S)
+          t, c = pat.subn('\n', t, count=1)
+          if c != 1:
+              fail("tour support step not found")
+          write(p, t)
+          print("AMN UI patch applied OK")
+          PYEOF
+
+      - name: 5c. Remove Vault tab and finish AMN branding
+        run: |
+          python3 - << 'PYEOF'
+          from pathlib import Path
+          import sys
+
+          def patch(path, old, new, label, count=1):
+              p = Path(path)
+              if not p.exists():
+                  raise SystemExit(f"AMN patch failed: missing {path}")
+              text = p.read_text(encoding="utf-8")
+              actual = text.count(old)
+              if actual < count:
+                  raise SystemExit(f"AMN patch failed: {label} (expected at least {count}, found {actual})")
+              p.write_text(text.replace(old, new, count), encoding="utf-8")
+
+          nav = "shared/src/commonMain/kotlin/dev/cluvex/zedsecure/ui/navigation/NavBar.kt"
+          patch(nav, "TopDestination.entries.forEach { dest ->",
+                "TopDestination.entries.filter { it != TopDestination.Vault }.forEach { dest ->",
+                "hide Vault from navigation", count=4)
+
+          main = "shared/src/commonMain/kotlin/dev/cluvex/zedsecure/ui/MainScaffold.kt"
+          patch(main, "onImported = { current = TopDestination.Vault }",
+                "onImported = { current = TopDestination.Servers }", "route imported configs to Servers")
+          patch(main, "current = if (activeProfile?.isLocked == true) TopDestination.Vault\n                        else TopDestination.Servers",
+                "current = TopDestination.Servers", "remove hidden Vault browse route")
+
+          hero = "shared/src/commonMain/kotlin/dev/cluvex/zedsecure/ui/settings/SettingsHero.kt"
+          old = "\n".join([
+              "        Icon(",
+              "            painterResource(Res.drawable.ic_zed_glyph),",
+              "            contentDescription = null,",
+              "            tint = cs.onPrimary,",
+              "            modifier = Modifier.size(58.dp),",
+              "        )",
+          ])
+          new = "\n".join([
+              "        Text(",
+              '            text = "AMN",',
+              "            color = cs.onPrimary,",
+              "            fontSize = MaterialTheme.typography.titleLarge.fontSize,",
+              "            fontWeight = androidx.compose.ui.text.font.FontWeight.Black,",
+              "            maxLines = 1,",
+              "        )",
+          ])
+          patch(hero, old, new, "replace Settings Z mark with AMN")
+
+          icon = Path("app/src/main/res/drawable/ic_tile_zed.xml")
+          if not icon.exists():
+              raise SystemExit("AMN patch failed: notification icon file missing")
+          icon.write_text("\n".join([
+              '<vector xmlns:android="http://schemas.android.com/apk/res/android"',
+              '    android:width="24dp" android:height="24dp"',
+              '    android:viewportWidth="24" android:viewportHeight="24">',
+              '    <path android:fillColor="#FFFFFFFF"',
+              '      android:pathData="M12,2.5 L22,21.5 L17.2,21.5 L15.2,17.5 L8.8,17.5 L6.8,21.5 L2,21.5 Z M10.2,13.8 L13.8,13.8 L12,10.2 Z" />',
+              '</vector>',
+          ]), encoding="utf-8")
+
+          for base in (Path("shared/src/commonMain/composeResources"), Path("app/src/main/res")):
+              for p in base.glob("values*/strings.xml"):
+                  text = p.read_text(encoding="utf-8")
+                  import re
+                  updated = re.sub(r'>([^<]*?)ZedSecure([^<]*?)<', lambda m: '>' + m.group(1) + 'AMN' + m.group(2) + '<', text, flags=re.IGNORECASE)
+                  if updated != text:
+                      p.write_text(updated, encoding="utf-8")
+          print("AMN branding and Vault navigation patch applied")
+          PYEOF
+
+      - name: 5d-1. Add subscription usage UI file
+        run: |
+          mkdir -p shared/src/commonMain/kotlin/dev/cluvex/zedsecure/ui/components
+          cat > shared/src/commonMain/kotlin/dev/cluvex/zedsecure/ui/components/SubscriptionUsage.kt << 'KTEOF'
+          package dev.cluvex.zedsecure.ui.components
+
+          import androidx.compose.animation.core.animateFloatAsState
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.shape.CircleShape
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.*
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.graphics.Brush
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.Shape
+          import androidx.compose.ui.graphics.luminance
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.style.TextOverflow
+          import androidx.compose.ui.unit.dp
+          import dev.cluvex.zedsecure.core.AutoSelect
+          import dev.cluvex.zedsecure.domain.config.Subscription
+          import dev.cluvex.zedsecure.domain.config.VpnProfile
+          import dev.cluvex.zedsecure.platform.currentTimeMillis
+          import dev.cluvex.zedsecure.shared.resources.Res
+          import dev.cluvex.zedsecure.shared.resources.*
+          import dev.cluvex.zedsecure.ui.format.formatBytes
+          import dev.cluvex.zedsecure.ui.format.ltrIsolate
+          import org.jetbrains.compose.resources.stringResource
+
+          data class SubUsage(
+              val name: String,
+              val used: Long?,
+              val total: Long?,
+              val expireAt: Long?,
+              val forcedUnlimited: Boolean = false,
+          ) {
+              val unlimited: Boolean get() = forcedUnlimited || total == null
+          }
+
+          private fun Subscription.hasUsageInfo(): Boolean = used != null || total != null || expireAt != null
+
+          fun subUsageOf(sub: Subscription): SubUsage? = sub.toSubUsage()
+
+          fun Subscription.toSubUsage(): SubUsage? =
+              if (!hasUsageInfo()) null
+              else SubUsage(name = name.ifBlank { title.orEmpty() }, used = used, total = total, expireAt = expireAt)
+
+          fun resolveSubUsage(
+              profile: VpnProfile?,
+              subscriptions: List<Subscription>,
+              profiles: List<VpnProfile>,
+              session: AutoSelect.Session?,
+          ): SubUsage? {
+              val active = profile ?: return null
+              var effective = active
+              if (active.isAutoSelect && active.subscriptionId.isBlank()) {
+                  val picked = session
+                      ?.takeIf { it.profileId == active.id }
+                      ?.selectedProfileId
+                      ?.let { id -> profiles.firstOrNull { it.id == id } }
+                  if (picked != null) effective = picked
+              }
+              if (effective.isPsiphon) {
+                  return SubUsage(
+                      name = effective.name.ifBlank { "Psiphon" },
+                      used = null,
+                      total = null,
+                      expireAt = null,
+                      forcedUnlimited = true,
+                  )
+              }
+              val sub = subscriptions.firstOrNull { it.id == effective.subscriptionId && effective.subscriptionId.isNotBlank() }
+                  ?: if (effective.isAutoSelect) subscriptions.firstOrNull { it.hasUsageInfo() } else null
+              return sub?.toSubUsage()
+          }
+
+          @Composable
+          fun SubUsageStrip(
+              usage: SubUsage,
+              modifier: Modifier = Modifier,
+              container: Color = MaterialTheme.colorScheme.surfaceContainerHigh,
+              content: Color = MaterialTheme.colorScheme.onSurface,
+              accent: Color = MaterialTheme.colorScheme.primary,
+              shape: Shape = RoundedCornerShape(6.dp),
+          ) {
+              val now = currentTimeMillis()
+              val used = usage.used
+              val total = usage.total
+              val unlimited = usage.unlimited
+              val fraction: Float? =
+                  if (!unlimited && used != null && total != null && total > 0L) {
+                      (used.toDouble() / total.toDouble()).toFloat().coerceIn(0f, 1f)
+                  } else null
+              val expireAt = usage.expireAt
+              val expired = expireAt != null && expireAt <= now
+              val daysLeft = expireAt?.let { ((it - now) / 86_400_000L).toInt() }
+              val exhausted = fraction != null && fraction >= 1f
+              val warning = !expired && !exhausted &&
+                  ((fraction != null && fraction >= 0.8f) || (daysLeft != null && daysLeft <= 3))
+              val dark = container.luminance() < 0.5f
+              val state = when {
+                  expired || exhausted -> MaterialTheme.colorScheme.error
+                  warning -> if (dark) Color(0xFFFFB74D) else Color(0xFF9A5B00)
+                  else -> accent
+              }
+
+              val daysText = when {
+                  expireAt == null -> stringResource(Res.string.sub_usage_no_expiry)
+                  expired -> stringResource(Res.string.subs_expired)
+                  (daysLeft ?: 0) <= 0 -> stringResource(Res.string.subs_expires_today)
+                  daysLeft == 1 -> stringResource(Res.string.subs_one_day_left)
+                  else -> stringResource(Res.string.subs_days_left, daysLeft ?: 0)
+              }
+
+              Surface(
+                  color = container,
+                  contentColor = content,
+                  shape = shape,
+                  modifier = modifier.fillMaxWidth(),
+              ) {
+                  Column(
+                      Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
+                      verticalArrangement = Arrangement.spacedBy(8.dp),
+                  ) {
+                      Row(verticalAlignment = Alignment.CenterVertically) {
+                          Text(
+                              text = usage.name,
+                              style = MaterialTheme.typography.titleSmall,
+                              fontWeight = FontWeight.SemiBold,
+                              color = content,
+                              maxLines = 1,
+                              overflow = TextOverflow.Ellipsis,
+                              modifier = Modifier.weight(1f),
+                          )
+                          Spacer(Modifier.width(8.dp))
+                          Box(
+                              Modifier
+                                  .clip(CircleShape)
+                                  .background(state.copy(alpha = 0.16f))
+                                  .padding(horizontal = 10.dp, vertical = 3.dp),
+                          ) {
+                              Text(
+                                  text = if (expireAt == null) "\u221E  $daysText" else daysText,
+                                  style = MaterialTheme.typography.labelMedium,
+                                  fontWeight = FontWeight.SemiBold,
+                                  color = state,
+                                  maxLines = 1,
+                              )
+                          }
+                      }
+
+                      val target = when {
+                          unlimited -> 1f
+                          fraction != null -> fraction
+                          else -> 0f
+                      }
+                      val animated by animateFloatAsState(target, label = "sub-usage-bar")
+                      Box(
+                          Modifier
+                              .fillMaxWidth()
+                              .height(8.dp)
+                              .clip(CircleShape)
+                              .background(content.copy(alpha = 0.14f)),
+                      ) {
+                          if (animated > 0f) {
+                              Box(
+                                  Modifier
+                                      .fillMaxWidth(animated.coerceIn(0.03f, 1f))
+                                      .fillMaxHeight()
+                                      .clip(CircleShape)
+                                      .background(
+                                          Brush.horizontalGradient(
+                                              if (unlimited) listOf(state.copy(alpha = 0.45f), state)
+                                              else listOf(state, state),
+                                          ),
+                                      ),
+                              )
+                          }
+                      }
+
+                      Row(
+                          Modifier.fillMaxWidth(),
+                          horizontalArrangement = Arrangement.SpaceBetween,
+                          verticalAlignment = Alignment.Top,
+                      ) {
+                          UsageStat(
+                              label = stringResource(Res.string.sub_usage_used),
+                              value = ltrIsolate(formatBytes(used ?: 0L)),
+                              color = content,
+                          )
+                          if (unlimited) {
+                              UsageStat(
+                                  label = stringResource(Res.string.sub_usage_total),
+                                  value = "\u221E " + stringResource(Res.string.sub_usage_unlimited),
+                                  color = content,
+                                  horizontal = Alignment.End,
+                              )
+                          } else if (total != null) {
+                              UsageStat(
+                                  label = stringResource(Res.string.sub_usage_left),
+                                  value = ltrIsolate(formatBytes((total - (used ?: 0L)).coerceAtLeast(0L))),
+                                  color = content,
+                                  horizontal = Alignment.CenterHorizontally,
+                              )
+                              UsageStat(
+                                  label = stringResource(Res.string.sub_usage_total),
+                                  value = ltrIsolate(formatBytes(total)),
+                                  color = content,
+                                  horizontal = Alignment.End,
+                              )
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          private fun UsageStat(
+              label: String,
+              value: String,
+              color: Color,
+              horizontal: Alignment.Horizontal = Alignment.Start,
+          ) {
+              Column(horizontalAlignment = horizontal) {
+                  Text(
+                      text = value,
+                      style = MaterialTheme.typography.labelLarge,
+                      fontWeight = FontWeight.SemiBold,
+                      color = color,
+                      maxLines = 1,
+                  )
+                  Text(
+                      text = label,
+                      style = MaterialTheme.typography.labelSmall,
+                      color = color.copy(alpha = 0.7f),
+                      maxLines = 1,
+                  )
+              }
+          }
+          KTEOF
+
+      - name: 5d-2. Hook subscription usage into screens
+        run: |
+          python3 - << 'PYEOF'
+          from pathlib import Path
+          import re, sys
+
+          def patch(path, old, new, label):
+              p = Path(path)
+              if not p.exists():
+                  raise SystemExit(f"AMN SUB PATCH FAILED: missing {path}")
+              t = p.read_text(encoding="utf-8")
+              n = t.count(old)
+              if n != 1:
+                  raise SystemExit(f"AMN SUB PATCH FAILED: {label} (found {n} matches, expected 1)")
+              p.write_text(t.replace(old, new, 1), encoding="utf-8")
+
+          KT = "shared/src/commonMain/kotlin/dev/cluvex/zedsecure/ui"
+          U = "dev.cluvex.zedsecure.ui.components"
+
+          # ---- strings (en / fa / ru / zh)
+          S = {
+            "values": ("Used", "Left", "Total", "Unlimited", "No expiry"),
+            "values-fa": ("مصرف‌شده", "باقی‌مانده", "حجم کل", "نامحدود", "بدون انقضا"),
+            "values-ru": ("Использовано", "Осталось", "Всего", "Безлимит", "Без срока"),
+            "values-zh": ("已用", "剩余", "总计", "无限", "永久有效"),
+          }
+          for folder, (u, l, t_, unl, ne) in S.items():
+              p = Path(f"shared/src/commonMain/composeResources/{folder}/strings.xml")
+              if not p.exists():
+                  continue
+              txt = p.read_text(encoding="utf-8")
+              if "sub_usage_used" in txt:
+                  continue
+              block = (
+                  f'    <string name="sub_usage_used">{u}</string>\n'
+                  f'    <string name="sub_usage_left">{l}</string>\n'
+                  f'    <string name="sub_usage_total">{t_}</string>\n'
+                  f'    <string name="sub_usage_unlimited">{unl}</string>\n'
+                  f'    <string name="sub_usage_no_expiry">{ne}</string>\n'
+              )
+              idx = txt.rindex("</resources>")
+              p.write_text(txt[:idx] + block + txt[idx:], encoding="utf-8")
+
+          # ---- MainScaffold: resolve the quota of the active profile (also in Auto-config mode)
+          patch(KT + "/MainScaffold.kt",
+                "                    design = settings.appDesign,\n                    contentPadding = innerPadding,",
+                "                    design = settings.appDesign,\n"
+                f"                    subUsage = {U}.resolveSubUsage(activeProfile, subscriptions, profiles, autoSession),\n"
+                "                    contentPadding = innerPadding,",
+                "MainScaffold HomeScreen call")
+
+          # ---- HomeScreen (entry + Old design)
+          H = KT + "/home/HomeScreen.kt"
+          patch(H, "    design: AppDesign = AppDesign.Pixel,\n    homeVm:",
+                f"    design: AppDesign = AppDesign.Pixel,\n    subUsage: {U}.SubUsage? = null,\n    homeVm:",
+                "HomeScreen signature")
+          patch(H, "                PixelHome(\n                    ui = ui,",
+                "                PixelHome(\n                    subUsage = subUsage,\n                    ui = ui,", "PixelHome call")
+          patch(H, "                PortalHome(\n                    ui = ui,",
+                "                PortalHome(\n                    subUsage = subUsage,\n                    ui = ui,", "PortalHome call")
+          patch(H,
+                "                    onClick = onBrowseConfigs,\n                    personalization = personalization,\n                )\n"
+                "                Spacer(Modifier.height(if (compact) 8.dp else 14.dp))\n                when (connectStyle) {",
+                "                    onClick = onBrowseConfigs,\n                    personalization = personalization,\n                )\n"
+                "                subUsage?.let { u ->\n"
+                "                    Spacer(Modifier.height(6.dp))\n"
+                "                    val customBg = personalization.configCardColor\n"
+                "                    val bg = customBg ?: MaterialTheme.colorScheme.surfaceContainerHigh\n"
+                "                    val fg = personalization.configCardTextColor\n"
+                "                        ?: customBg?.let { if (it.luminance() > 0.5f) androidx.compose.ui.graphics.Color(0xFF111318) else androidx.compose.ui.graphics.Color(0xFFF5F6FA) }\n"
+                "                        ?: MaterialTheme.colorScheme.onSurface\n"
+                f"                    {U}.SubUsageStrip(\n"
+                "                        usage = u,\n"
+                "                        container = bg,\n"
+                "                        content = fg,\n"
+                "                        accent = if (customBg != null) fg else MaterialTheme.colorScheme.primary,\n"
+                "                        shape = MaterialTheme.shapes.largeIncreased,\n"
+                "                    )\n"
+                "                }\n"
+                "                Spacer(Modifier.height(if (compact) 8.dp else 14.dp))\n                when (connectStyle) {",
+                "Old design strip")
+          if "import androidx.compose.ui.graphics.luminance" not in Path(H).read_text(encoding="utf-8"):
+              t = Path(H).read_text(encoding="utf-8")
+              t = t.replace("import kotlin.math.ln\n", "import androidx.compose.ui.graphics.luminance\nimport kotlin.math.ln\n", 1)
+              Path(H).write_text(t, encoding="utf-8")
+
+          # ---- Pixel design: between server row and download/upload
+          P = KT + "/home/PixelHome.kt"
+          patch(P, "    activeConfigDetail: String?,\n",
+                f"    activeConfigDetail: String?,\n    subUsage: {U}.SubUsage? = null,\n", "PixelHome signature")
+          patch(P,
+                "                        modifier = Modifier.tourTarget(TourTargets.CONFIG_CARD),\n                    )\n                    PixelStats(",
+                "                        modifier = Modifier.tourTarget(TourTargets.CONFIG_CARD),\n                    )\n"
+                f"                    subUsage?.let {{ {U}.SubUsageStrip(usage = it, shape = RoundedCornerShape(6.dp)) }}\n"
+                "                    PixelStats(",
+                "Pixel strip")
+
+          # ---- Portal design: between flow meter and ticket
+          Q = KT + "/home/PortalHome.kt"
+          patch(Q, "    activeConfigDetail: String?,\n",
+                f"    activeConfigDetail: String?,\n    subUsage: {U}.SubUsage? = null,\n", "PortalHome signature")
+          patch(Q,
+                "                Spacer(Modifier.height(8.dp))\n                PortalTicket(",
+                "                Spacer(Modifier.height(8.dp))\n"
+                "                subUsage?.let { u ->\n"
+                f"                    {U}.SubUsageStrip(\n"
+                "                        usage = u,\n"
+                "                        shape = RoundedCornerShape(22.dp),\n"
+                "                        modifier = Modifier.padding(horizontal = 20.dp),\n"
+                "                    )\n"
+                "                    Spacer(Modifier.height(8.dp))\n"
+                "                }\n"
+                "                PortalTicket(",
+                "Portal strip")
+
+          # ---- Servers screen: quota card above the list for the selected subscription tab + Psiphon badge
+          V = KT + "/servers/ServersScreen.kt"
+          patch(V,
+                "            androidx.compose.animation.AnimatedVisibility(visible = selecting) {",
+                f"            openSubscription?.let {{ {U}.subUsageOf(it) }}?.let {{ u ->\n"
+                f"                {U}.SubUsageStrip(\n"
+                "                    usage = u,\n"
+                "                    container = personalization.serverCardColor ?: MaterialTheme.colorScheme.surfaceContainerHigh,\n"
+                "                    content = personalization.serverCardColor?.readableOn() ?: MaterialTheme.colorScheme.onSurface,\n"
+                "                    accent = personalization.serverCardColor?.readableOn() ?: MaterialTheme.colorScheme.primary,\n"
+                "                    shape = RoundedCornerShape(personalization.cornerStyle.serverCardDp.dp),\n"
+                "                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 6.dp),\n"
+                "                )\n"
+                "            }\n"
+                "            androidx.compose.animation.AnimatedVisibility(visible = selecting) {",
+                "Servers quota card")
+          patch(V,
+                "                if (personalization.showServerUsage && (profile.bytesDown > 0 || profile.bytesUp > 0)) {",
+                "                if (profile.isPsiphon) {\n"
+                "                    Spacer(Modifier.height(2.dp))\n"
+                "                    Text(\n"
+                "                        text = \"\\u221E \" + stringResource(Res.string.sub_usage_unlimited),\n"
+                "                        style = MaterialTheme.typography.labelSmall,\n"
+                "                        fontWeight = FontWeight.SemiBold,\n"
+                "                        color = subtle,\n"
+                "                        maxLines = 1,\n"
+                "                    )\n"
+                "                }\n"
+                "                if (personalization.showServerUsage && (profile.bytesDown > 0 || profile.bytesUp > 0)) {",
+                "Psiphon unlimited badge")
+
+          # ---- Core: if the first response had no quota headers, probe other User-Agents for them
+          C = "shared/src/commonMain/kotlin/dev/cluvex/zedsecure/data/config/ConfigRepository.kt"
+          patch(C,
+                "            previous.firstOrNull { it.id == previousActive && SingBoxOnlyServers.isPlaceholder(it) }?.let { old ->",
+                "            if (meta.upload == null && meta.download == null && meta.total == null && meta.expireAt == null) {\n"
+                "                for (probeUa in listOf(\"Happ/2.0\", ALT_UA).filter { it != primaryUa }) {\n"
+                "                    val probed = runCatching { SubscriptionHeaders.parse(fetch(sub.url, probeUa).headers) }.getOrNull()\n"
+                "                        ?: continue\n"
+                "                    if (probed.upload != null || probed.download != null || probed.total != null || probed.expireAt != null) {\n"
+                "                        meta = meta.copy(\n"
+                "                            upload = probed.upload,\n"
+                "                            download = probed.download,\n"
+                "                            total = probed.total,\n"
+                "                            expireAt = probed.expireAt,\n"
+                "                        )\n"
+                "                        break\n"
+                "                    }\n"
+                "                }\n"
+                "            }\n\n"
+                "            previous.firstOrNull { it.id == previousActive && SingBoxOnlyServers.isPlaceholder(it) }?.let { old ->",
+                "ConfigRepository header probe")
+          print("AMN subscription-usage patch applied OK")
+          PYEOF
+
+      - name: 6. Generate AMN Logo with Exact Standard Dimensions
+        run: |
+          sudo apt-get update && sudo apt-get install -y librsvg2-bin python3-pil
+          cat << 'EOF' > amn_logo.svg
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+            <defs>
+              <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+                <stop offset="0%" stop-color="#090D16"/>
+                <stop offset="100%" stop-color="#131B2E"/>
+              </linearGradient>
+              <linearGradient id="sh" x1="0%" y1="0%" x2="100%" y2="100%">
+                <stop offset="0%" stop-color="#00F5D4"/>
+                <stop offset="100%" stop-color="#2563EB"/>
+              </linearGradient>
+            </defs>
+            <rect width="512" height="512" rx="115" fill="url(#bg)"/>
+            <path d="M256 76 L406 140 V256 C406 355 340 425 256 456 C172 425 106 355 106 256 V140 Z" fill="#131B2E" stroke="url(#sh)" stroke-width="24" stroke-linejoin="round"/>
+            <text x="256" y="292" font-family="sans-serif" font-size="100" font-weight="900" fill="#FFFFFF" text-anchor="middle">AMN</text>
+            <rect x="186" y="322" width="140" height="10" rx="5" fill="url(#sh)"/>
+          </svg>
+          EOF
+
+          rsvg-convert -w 512 -h 512 amn_logo.svg -o amn_logo.png
+          rm -rf app/src/main/res/mipmap-anydpi*
+
+          python3 - << 'EOF'
+          import os
+          from PIL import Image
+
+          master = Image.open("amn_logo.png").convert("RGBA")
+          for root, _, files in os.walk("app/src/main/res"):
+              for file in files:
+                  if file.startswith("ic_launcher") and file.endswith((".png", ".webp")):
+                      path = os.path.join(root, file)
+                      try:
+                          with Image.open(path) as img:
+                              size = img.size
+                              fmt = img.format or ("WEBP" if file.endswith(".webp") else "PNG")
+                          resized = master.resize(size, Image.Resampling.LANCZOS)
+                          resized.save(path, format=fmt)
+                      except Exception:
+                          pass
+          EOF
+
+      - name: 7. Build Release APKs with Retry
+        run: |
+          chmod +x gradlew
+          for i in 1 2 3; do
+            ./gradlew assembleRelease --no-daemon && break || {
+              echo "Retrying gradle build ($i)..."
+              sleep 10
+            }
+          done
+
+      - name: 8. Sign APKs with Persistent AMN Keystore (Allows Updating Without Uninstalling)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MY_REPO: ${{ github.repository }}
+          APP_VER: ${{ inputs.app_version || '3.1.7' }}
+        run: |
+          if ! gh release download amn-keystore-vault -p "amn-release.jks" --repo "$MY_REPO" 2>/dev/null; then
+            echo "Generating permanent AMN Keystore for the first time..."
+            keytool -genkeypair -v \
+              -keystore amn-release.jks \
+              -alias amn_key \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -storepass AMNSecure2026! \
+              -keypass AMNSecure2026! \
+              -dname "CN=AMN, OU=Security, O=AMN, L=Tehran, S=Tehran, C=IR"
+            gh release create amn-keystore-vault amn-release.jks \
+              --repo "$MY_REPO" \
+              --title "AMN Permanent Keystore (Do Not Delete)" \
+              --notes "Permanent signing key so future updates install over existing app without uninstalling." \
+              --prerelease || true
+          else
+            echo "Reusing existing permanent AMN Keystore from amn-keystore-vault..."
+          fi
+
+          mkdir -p output_apks
+          ZIPALIGN=$(find "$ANDROID_HOME/build-tools" -name "zipalign" | sort -V | tail -n 1)
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name "apksigner" | sort -V | tail -n 1)
+
+          for apk in $(find app/build/outputs/apk/release -name "*.apk"); do
+            base_name=$(basename "$apk" | sed 's/-unsigned//g' | sed 's/-release//g' | sed 's/ZedSecure/AMN/g' | sed 's/app-/AMN-v'"$APP_VER"'-/g')
+            "$ZIPALIGN" -f -p 4 "$apk" "aligned-$base_name"
+            "$APKSIGNER" sign \
+              --ks amn-release.jks \
+              --ks-key-alias amn_key \
+              --ks-pass pass:AMNSecure2026! \
+              --key-pass pass:AMNSecure2026! \
+              --v1-signing-enabled true \
+              --v2-signing-enabled true \
+              --v3-signing-enabled true \
+              --out "output_apks/$base_name" \
+              "aligned-$base_name"
+          done
+
+      - name: 9. Publish APKs to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: AMN-v${{ inputs.app_version || '3.1.7' }}
+          name: "AMN Security v${{ inputs.app_version || '3.1.7' }}"
+          make_latest: true
+          body: |
+            ### What's new
+            ${{ inputs.release_notes || '• بهبود سرعت و پایداری اتصال و بهینه‌سازی رابط کاربری اختصاصی AMN' }}
+
+            ---
+            - **پشتیبانی تلگرام:** [@A_Mourdini_N](https://t.me/A_Mourdini_N)
+            - **نسخه پیشنهادی برای اکثر گوشی‌ها:** `arm64-v8a`
+          files: output_apks/*.apk
